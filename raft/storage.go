@@ -108,6 +108,9 @@ func (ms *MemoryStorage) SetHardState(st pb.HardState) error {
 
 // Entries implements the Storage interface.
 func (ms *MemoryStorage) Entries(lo, hi uint64) ([]pb.Entry, error) {
+	if lo >= hi {
+		return nil, ErrUnavailable
+	}
 	ms.Lock()
 	defer ms.Unlock()
 	offset := ms.ents[0].Index
