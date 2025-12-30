@@ -206,7 +206,7 @@ func (rn *RawNode) Advance(rd Ready) {
 		rn.prevSoftState = rd.SoftState
 	}
 	if len(rd.Entries) > 0 {
-		rn.Raft.RaftLog.stabled += uint64(len(rd.Entries))
+		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
 	}
 	if len(rd.CommittedEntries) > 0 {
 		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index

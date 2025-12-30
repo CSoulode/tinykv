@@ -65,13 +65,15 @@ func newLog(storage Storage) *RaftLog {
 		applied:   0,
 		entries:   []pb.Entry{{Term: prevLogIndex, Index: firstLogIndex - 1}},
 	}
+	offset := r.entries[0].Index
 	hardState, _, _ := storage.InitialState()
-	r.committed = hardState.Commit
+	r.committed = max(hardState.Commit, offset)
+	r.applied = offset
 	ents, _ := storage.Entries(firstLogIndex, lastLogIndex+1)
 	if ents != nil {
 		r.entries = append(r.entries, ents...)
 	}
-	r.stabled = uint64(len(r.entries) - 1)
+	r.stabled = uint64(len(r.entries)-1) + r.entries[0].Index
 
 	return &r
 }
@@ -94,23 +96,32 @@ func (l *RaftLog) allEntries() []pb.Entry {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return l.entries[l.stabled+1:]
+	offset := l.entries[0].Index
+	return l.entries[l.stabled+1-offset:]
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	return l.entries[l.applied+1 : l.committed+1]
+	offset := l.entries[0].Index
+	return l.entries[l.applied+1-offset : l.committed+1-offset]
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	return uint64(len(l.entries)) - 1
+	return l.entries[0].Index + uint64(len(l.entries)) - 1
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	return l.entries[i].Term, nil
+	offset := l.entries[0].Index
+	if i < offset {
+		return 0, ErrCompacted
+	}
+	if int(i-offset) >= len(l.entries) {
+		return 0, ErrUnavailable
+	}
+	return l.entries[i-offset].Term, nil
 }

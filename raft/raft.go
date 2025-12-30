@@ -174,14 +174,8 @@ func newRaft(c *Config) *Raft {
 	}
 	// Your Code Here (2A).
 	prs := make(map[uint64]*Progress)
-	for _, peer := range c.peers {
-		prs[peer] = &Progress{
-			Match: 0,
-			Next:  0,
-		}
-	}
 
-	hardState, _, _ := c.Storage.InitialState()
+	hardState, ConfState, _ := c.Storage.InitialState()
 
 	r := &Raft{
 		id:               c.ID,
@@ -201,6 +195,18 @@ func newRaft(c *Config) *Raft {
 		PendingConfIndex: 0,
 	}
 
+	if len(c.peers) == 0 {
+		c.peers = ConfState.Nodes
+	}
+	for _, peer := range c.peers {
+		prs[peer] = &Progress{
+			Match: r.RaftLog.entries[0].Index,
+			Next:  r.RaftLog.entries[0].Index,
+		}
+	}
+
+	r.RaftLog.applied = max(r.RaftLog.applied, c.Applied)
+
 	r.resetRandomizedElectionTimeout()
 
 	return r
@@ -217,7 +223,8 @@ func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
 	prevLogIndex := r.Prs[to].Next - 1
 	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
-	entries := r.RaftLog.entries[prevLogIndex+1:]
+	offset := r.RaftLog.entries[0].Index
+	entries := r.RaftLog.entries[prevLogIndex+1-offset:]
 	entriess := make([]*pb.Entry, len(entries))
 	for i := range entries {
 		entriess[i] = &entries[i]
@@ -513,8 +520,10 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	r.Lead = m.From
 	r.electionElapsed = 0
 
+	offset := r.RaftLog.entries[0].Index
+
 	lastLogIndex := r.RaftLog.LastIndex()
-	if m.Term < r.Term || m.Index > lastLogIndex || r.RaftLog.entries[m.Index].Term != m.LogTerm {
+	if m.Term < r.Term || m.Index > lastLogIndex || r.RaftLog.entries[m.Index-offset].Term != m.LogTerm {
 		r.msgs = append(r.msgs, pb.Message{
 			MsgType: pb.MessageType_MsgAppendResponse,
 			To:      m.From,
@@ -528,8 +537,8 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	i := m.Index + 1
 	j := 0
 	for ; i <= lastLogIndex && j < len(m.Entries); i, j = i+1, j+1 {
-		if r.RaftLog.entries[i].Term != m.Entries[j].Term {
-			r.RaftLog.entries = r.RaftLog.entries[:i]
+		if r.RaftLog.entries[i-offset].Term != m.Entries[j].Term {
+			r.RaftLog.entries = r.RaftLog.entries[:i-offset]
 			break
 		}
 	}
@@ -558,7 +567,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 
 func (r *Raft) handleAppendResponse(m pb.Message) {
 	if m.Reject {
-		if r.Prs[m.From].Next > 1 {
+		if r.Prs[m.From].Next > (1 + r.RaftLog.entries[0].Index) {
 			r.Prs[m.From].Next = r.Prs[m.From].Next - 1
 		}
 		r.sendAppend(m.From)
