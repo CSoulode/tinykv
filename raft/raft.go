@@ -535,8 +535,36 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 
 	offset := r.RaftLog.entries[0].Index
 
+	sendReject := func(hintIndex uint64, hintTerm uint64) {
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			To:      m.From,
+			From:    r.id,
+			Term:    r.Term,
+			Reject:  true,
+			Index:   hintIndex,
+			LogTerm: hintTerm,
+		})
+	}
+
 	lastLogIndex := r.RaftLog.LastIndex()
-	if m.Term < r.Term || m.Index > lastLogIndex || r.RaftLog.entries[m.Index-offset].Term != m.LogTerm {
+	if m.Index > lastLogIndex {
+		sendReject(lastLogIndex+1, None)
+		return
+	}
+	if r.RaftLog.entries[m.Index-offset].Term != m.LogTerm {
+		term := r.RaftLog.entries[m.Index-offset].Term
+		index := m.Index - offset
+		for ; index > 0; index-- {
+			if r.RaftLog.entries[index].Term != term {
+				break
+			}
+		}
+		sendReject(index+1+offset, term)
+		return
+	}
+
+	if m.Index > lastLogIndex || r.RaftLog.entries[m.Index-offset].Term != m.LogTerm {
 		r.msgs = append(r.msgs, pb.Message{
 			MsgType: pb.MessageType_MsgAppendResponse,
 			To:      m.From,
@@ -580,8 +608,23 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 
 func (r *Raft) handleAppendResponse(m pb.Message) {
 	if m.Reject {
-		if r.Prs[m.From].Next > (1 + r.RaftLog.entries[0].Index) {
-			r.Prs[m.From].Next = r.Prs[m.From].Next - 1
+		if m.LogTerm == None {
+			r.Prs[m.From].Next = m.Index
+		} else {
+			offset := r.RaftLog.entries[0].Index
+			term := m.LogTerm
+			index := m.Index - offset
+
+			for ; index > 0; index-- {
+				if r.RaftLog.entries[index-1].Term == term {
+					break
+				}
+			}
+			if index <= 0 {
+				r.Prs[m.From].Next = m.Index
+			} else {
+				r.Prs[m.From].Next = index + offset
+			}
 		}
 		r.sendAppend(m.From)
 	} else {
