@@ -164,6 +164,9 @@ func (rn *RawNode) Ready() Ready {
 		CommittedEntries: r.RaftLog.nextEnts(),
 		Messages:         r.msgs,
 	}
+	if r.RaftLog.pendingSnapshot != nil {
+		rd.Snapshot = *r.RaftLog.pendingSnapshot
+	}
 	if softSt := r.softState(); !softSt.equal(rn.prevSoftState) {
 		escapingSoftSt := softSt
 		rd.SoftState = &escapingSoftSt
@@ -185,7 +188,9 @@ func (rn *RawNode) HasReady() bool {
 	if hardSt := r.hardState(); !isHardStateEqual(hardSt, rn.prevHardState) {
 		return true
 	}
-	//Todo: snapshot
+	if r.RaftLog.pendingSnapshot != nil {
+		return true
+	}
 	if len(r.msgs) > 0 {
 		return true
 	}
@@ -218,6 +223,9 @@ func (rn *RawNode) Advance(rd Ready) {
 		rn.stepsOnAdvance[i] = pb.Message{}
 	}
 	rn.stepsOnAdvance = rn.stepsOnAdvance[:0]
+
+	rn.Raft.RaftLog.maybeCompact()
+	rn.Raft.RaftLog.pendingSnapshot = nil
 }
 
 // GetProgress return the Progress of this node and its peers, if this

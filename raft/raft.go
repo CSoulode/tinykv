@@ -201,7 +201,7 @@ func newRaft(c *Config) *Raft {
 	for _, peer := range c.peers {
 		prs[peer] = &Progress{
 			Match: r.RaftLog.entries[0].Index,
-			Next:  r.RaftLog.entries[0].Index,
+			Next:  r.RaftLog.entries[0].Index + 1,
 		}
 	}
 
@@ -222,7 +222,15 @@ func (r *Raft) send(m pb.Message) bool {
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
 	prevLogIndex := r.Prs[to].Next - 1
-	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
+	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
+
+	if err == ErrCompacted {
+		return r.sendSnapshot(to)
+	}
+	if err == ErrUnavailable {
+		panic("sendAppend Err")
+	}
+
 	offset := r.RaftLog.entries[0].Index
 	entries := r.RaftLog.entries[prevLogIndex+1-offset:]
 	entriess := make([]*pb.Entry, len(entries))
@@ -273,11 +281,16 @@ func (r *Raft) sendRequestVoteResponse(to uint64) bool {
 }
 
 func (r *Raft) sendSnapshot(to uint64) bool {
+	snapshot, err := r.RaftLog.storage.Snapshot()
+	if err != nil {
+		panic(err.Error())
+	}
 	return r.send(pb.Message{
-		MsgType: pb.MessageType_MsgSnapshot,
-		To:      to,
-		From:    r.id,
-		Term:    r.Term,
+		MsgType:  pb.MessageType_MsgSnapshot,
+		To:       to,
+		From:     r.id,
+		Term:     r.Term,
+		Snapshot: &snapshot,
 	})
 }
 
@@ -411,7 +424,7 @@ func (r *Raft) Step(m pb.Message) error {
 		}
 		r.becomeFollower(m.Term, lead)
 	case m.Term < r.Term:
-		if m.MsgType == pb.MessageType_MsgHeartbeat || m.MsgType == pb.MessageType_MsgAppend {
+		if m.MsgType == pb.MessageType_MsgHeartbeat || m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgSnapshot {
 			r.send(pb.Message{
 				MsgType: pb.MessageType_MsgAppendResponse,
 				To:      m.From,
@@ -665,6 +678,57 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	if m.Snapshot == nil {
+		return
+	}
+	snapshot := m.Snapshot
+	if r.restore(snapshot) {
+		r.send(pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			To:      m.From,
+			From:    r.id,
+			Index:   r.RaftLog.LastIndex(),
+		})
+	} else {
+		r.send(pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			To:      m.From,
+			From:    r.id,
+			Index:   r.RaftLog.committed,
+		})
+	}
+}
+
+func (r *Raft) restore(snapshot *pb.Snapshot) bool {
+	sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
+	if sindex <= r.RaftLog.committed {
+		return false
+	}
+
+	term, err := r.RaftLog.Term(sindex)
+	if err == nil && term == sterm {
+		r.RaftLog.committed = sindex
+		return false
+	}
+
+	r.RaftLog.committed = sindex
+	r.RaftLog.applied = sindex
+	r.RaftLog.stabled = sindex
+
+	r.RaftLog.entries = []pb.Entry{{Term: sterm, Index: sindex}}
+
+	if snapshot.Metadata.ConfState != nil {
+		prs := make(map[uint64]*Progress)
+		for _, peer := range snapshot.Metadata.ConfState.Nodes {
+			prs[peer] = &Progress{
+				Match: r.RaftLog.entries[0].Index,
+				Next:  r.RaftLog.entries[0].Index + 1,
+			}
+		}
+		r.Prs = prs
+	}
+	r.RaftLog.pendingSnapshot = snapshot
+	return true
 }
 
 // handleHeartbeat handle Heartbeat RPC request
