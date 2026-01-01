@@ -57,23 +57,21 @@ type RaftLog struct {
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
 	firstLogIndex, _ := storage.FirstIndex()
-	prevLogIndex, _ := storage.Term(firstLogIndex - 1)
+	prevLogTerm, _ := storage.Term(firstLogIndex - 1)
 	lastLogIndex, _ := storage.LastIndex()
+
 	r := RaftLog{
-		storage:   storage,
-		committed: 0,
-		applied:   0,
-		entries:   []pb.Entry{{Term: prevLogIndex, Index: firstLogIndex - 1}},
+		storage: storage,
+		entries: []pb.Entry{{Term: prevLogTerm, Index: firstLogIndex - 1}},
 	}
-	offset := r.entries[0].Index
-	hardState, _, _ := storage.InitialState()
-	r.committed = max(hardState.Commit, offset)
-	r.applied = offset
+
 	ents, _ := storage.Entries(firstLogIndex, lastLogIndex+1)
 	if ents != nil {
 		r.entries = append(r.entries, ents...)
 	}
-	r.stabled = uint64(len(r.entries)-1) + r.entries[0].Index
+
+	r.applied = r.entries[0].Index
+	r.stabled = r.LastIndex()
 
 	return &r
 }
@@ -87,6 +85,16 @@ func (l *RaftLog) maybeCompact() {
 	offset := l.entries[0].Index
 	if sIndex-1 > offset {
 		l.entries = l.entries[sIndex-1-offset:]
+		offset = l.entries[0].Index
+		if l.applied < offset {
+			l.applied = offset
+		}
+		if l.committed < offset {
+			l.committed = offset
+		}
+		if l.stabled < offset {
+			l.stabled = offset
+		}
 	}
 }
 

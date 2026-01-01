@@ -194,6 +194,7 @@ func newRaft(c *Config) *Raft {
 		leadTransferee:   0,
 		PendingConfIndex: 0,
 	}
+	r.RaftLog.committed = hardState.Commit
 
 	if len(c.peers) == 0 {
 		c.peers = ConfState.Nodes
@@ -283,7 +284,10 @@ func (r *Raft) sendRequestVoteResponse(to uint64) bool {
 func (r *Raft) sendSnapshot(to uint64) bool {
 	snapshot, err := r.RaftLog.storage.Snapshot()
 	if err != nil {
-		panic(err.Error())
+		if err == ErrSnapshotTemporarilyUnavailable {
+			return false
+		}
+		panic(err)
 	}
 	return r.send(pb.Message{
 		MsgType:  pb.MessageType_MsgSnapshot,
@@ -473,7 +477,9 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleHeartbeatResponse(m)
 		}
 	case pb.MessageType_MsgTransferLeader:
-		r.handleTransferLeader(m)
+		if r.State == StateLeader {
+			r.handleTransferLeader(m)
+		}
 	case pb.MessageType_MsgTimeoutNow:
 		r.handleTimeoutNow(m)
 	}
@@ -548,7 +554,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	}
 
 	lastLogIndex := r.RaftLog.LastIndex()
-	if m.Index > lastLogIndex {
+	if m.Index < offset || m.Index > lastLogIndex {
 		sendReject(lastLogIndex+1, None)
 		return
 	}
@@ -613,7 +619,10 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 		} else {
 			offset := r.RaftLog.entries[0].Index
 			term := m.LogTerm
-			index := m.Index - offset
+			var index uint64 = 0 //prevent underflow
+			if m.Index > offset {
+				index = m.Index - offset
+			}
 
 			for ; index > 0; index-- {
 				if r.RaftLog.entries[index-1].Term == term {
@@ -721,7 +730,7 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
-	if m.Snapshot == nil {
+	if m.Snapshot == nil || r.RaftLog.pendingSnapshot != nil {
 		return
 	}
 	snapshot := m.Snapshot
@@ -786,7 +795,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 
 	lastLogIndex := r.RaftLog.LastIndex()
 
-	if m.Commit > lastLogIndex {
+	if m.Commit > r.RaftLog.committed {
 		r.RaftLog.committed = min(m.Commit, lastLogIndex)
 	}
 

@@ -6,6 +6,7 @@ import (
 
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
@@ -49,7 +50,10 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 
 	rd := d.RaftGroup.Ready()
-	d.peerStorage.SaveReadyState(&rd)
+	if _, err := d.peerStorage.SaveReadyState(&rd); err != nil {
+		log.Fatalf("%s SaveReadyState failed: %v", d.Tag, err)
+		return
+	}
 
 	if len(rd.Messages) > 0 {
 		d.Send(d.ctx.trans, rd.Messages)
@@ -57,24 +61,47 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 	for _, ent := range rd.CommittedEntries {
 		kvWb := &engine_util.WriteBatch{}
+
+		if len(ent.Data) == 0 {
+			d.peerStorage.applyState.AppliedIndex = ent.Index
+			kvWb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+			kvWb.WriteToDB(d.peerStorage.Engines.Kv)
+			continue
+		}
+
 		var request raft_cmdpb.RaftCmdRequest
-		err := request.Unmarshal(ent.Data)
-		if err != nil || len(request.Requests) == 0 {
-			continue
-		}
-		req := request.Requests[0]
-
-		switch req.CmdType {
-		case raft_cmdpb.CmdType_Get:
-		case raft_cmdpb.CmdType_Put:
-			kvWb.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
-		case raft_cmdpb.CmdType_Delete:
-			kvWb.DeleteCF(req.Delete.Cf, req.Delete.Key)
-		case raft_cmdpb.CmdType_Snap:
-		case raft_cmdpb.CmdType_Invalid:
-			continue
+		if err := request.Unmarshal(ent.Data); err != nil {
+			log.Fatalf("%s unmarshal committed entry at index %d failed: %v", d.Tag, ent.Index, err)
+			return
 		}
 
+		if adminReq := request.AdminRequest; adminReq != nil {
+			switch adminReq.CmdType {
+			case raft_cmdpb.AdminCmdType_ChangePeer:
+			case raft_cmdpb.AdminCmdType_CompactLog:
+				d.peerStorage.applyState.TruncatedState.Index = adminReq.CompactLog.CompactIndex
+				d.peerStorage.applyState.TruncatedState.Term = adminReq.CompactLog.CompactTerm
+				d.ScheduleCompactLog(adminReq.CompactLog.CompactIndex)
+			case raft_cmdpb.AdminCmdType_TransferLeader:
+			case raft_cmdpb.AdminCmdType_Split:
+			}
+		}
+
+		if len(request.Requests) > 0 {
+			req := request.Requests[0]
+			switch req.CmdType {
+			case raft_cmdpb.CmdType_Get:
+			case raft_cmdpb.CmdType_Put:
+				kvWb.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
+			case raft_cmdpb.CmdType_Delete:
+				kvWb.DeleteCF(req.Delete.Cf, req.Delete.Key)
+			case raft_cmdpb.CmdType_Snap:
+			case raft_cmdpb.CmdType_Invalid:
+			}
+		}
+
+		d.peerStorage.applyState.AppliedIndex = ent.Index
+		kvWb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 		kvWb.WriteToDB(d.peerStorage.Engines.Kv)
 
 		for len(d.proposals) > 0 && d.proposals[0].index < ent.Index {
@@ -84,31 +111,34 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 		if len(d.proposals) > 0 && d.proposals[0].index == ent.Index {
 			propose := d.proposals[0]
+			d.proposals = d.proposals[1:]
 
 			if propose.term != ent.Term {
 				NotifyStaleReq(ent.Term, propose.cb)
-				d.proposals = d.proposals[1:]
 				continue
 			}
 
 			response := &raft_cmdpb.RaftCmdResponse{Header: newCmdResp().Header}
-			switch req.CmdType {
-			case raft_cmdpb.CmdType_Get:
-				val, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
-				response.Responses = []*raft_cmdpb.Response{{CmdType: raft_cmdpb.CmdType_Get, Get: &raft_cmdpb.GetResponse{Value: val}}}
-			case raft_cmdpb.CmdType_Put:
-				response.Responses = []*raft_cmdpb.Response{{CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{}}}
-			case raft_cmdpb.CmdType_Delete:
-				response.Responses = []*raft_cmdpb.Response{{CmdType: raft_cmdpb.CmdType_Delete, Delete: &raft_cmdpb.DeleteResponse{}}}
-			case raft_cmdpb.CmdType_Snap:
-				response.Responses = []*raft_cmdpb.Response{{CmdType: raft_cmdpb.CmdType_Snap, Snap: &raft_cmdpb.SnapResponse{Region: d.Region()}}}
-				propose.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+			if len(request.Requests) > 0 {
+				req := request.Requests[0]
+				switch req.CmdType {
+				case raft_cmdpb.CmdType_Get:
+					val, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
+					response.Responses = []*raft_cmdpb.Response{{CmdType: raft_cmdpb.CmdType_Get, Get: &raft_cmdpb.GetResponse{Value: val}}}
+				case raft_cmdpb.CmdType_Put:
+					response.Responses = []*raft_cmdpb.Response{{CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{}}}
+				case raft_cmdpb.CmdType_Delete:
+					response.Responses = []*raft_cmdpb.Response{{CmdType: raft_cmdpb.CmdType_Delete, Delete: &raft_cmdpb.DeleteResponse{}}}
+				case raft_cmdpb.CmdType_Snap:
+					response.Responses = []*raft_cmdpb.Response{{CmdType: raft_cmdpb.CmdType_Snap, Snap: &raft_cmdpb.SnapResponse{Region: d.Region()}}}
+					propose.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+				}
 			}
 
 			propose.cb.Done(response)
-			d.proposals = d.proposals[1:]
 		}
 	}
+
 	d.RaftGroup.Advance(rd)
 }
 
