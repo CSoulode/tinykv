@@ -19,6 +19,7 @@ import (
 	"math/rand"
 	"sort"
 
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -194,7 +195,19 @@ func newRaft(c *Config) *Raft {
 		leadTransferee:   0,
 		PendingConfIndex: 0,
 	}
+
 	r.RaftLog.committed = hardState.Commit
+	lastIndex := r.RaftLog.LastIndex()
+	if r.RaftLog.committed > lastIndex {
+		r.RaftLog.committed = lastIndex
+		log.Fatal("newRaft: r.RaftLog.committed > lastIndex")
+	}
+
+	r.RaftLog.applied = max(r.RaftLog.applied, c.Applied)
+	if r.RaftLog.committed < r.RaftLog.applied {
+		r.RaftLog.committed = r.RaftLog.applied
+		log.Fatal("newRaft: r.RaftLog.committed < r.RaftLog.applied")
+	}
 
 	if len(c.peers) == 0 {
 		c.peers = ConfState.Nodes
@@ -205,8 +218,6 @@ func newRaft(c *Config) *Raft {
 			Next:  r.RaftLog.entries[0].Index + 1,
 		}
 	}
-
-	r.RaftLog.applied = max(r.RaftLog.applied, c.Applied)
 
 	r.resetRandomizedElectionTimeout()
 
@@ -289,6 +300,7 @@ func (r *Raft) sendSnapshot(to uint64) bool {
 		}
 		panic(err)
 	}
+	r.Prs[to].Next = snapshot.Metadata.Index + 1
 	return r.send(pb.Message{
 		MsgType:  pb.MessageType_MsgSnapshot,
 		To:       to,
@@ -368,10 +380,14 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.electionElapsed = 0
 	r.resetRandomizedElectionTimeout()
 	r.Vote = None
-
-	r.Term = term
 	r.State = StateFollower
 	r.Lead = lead
+	if term > r.Term {
+		r.Term = term
+		r.Vote = None
+	} else {
+		r.Term = term
+	}
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -392,6 +408,7 @@ func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
 	r.State = StateLeader
+	r.Lead = r.id
 	r.heartbeatElapsed = 0
 
 	lastLogIndex := r.RaftLog.LastIndex()
@@ -607,7 +624,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		To:      m.From,
 		From:    r.id,
 		Term:    r.Term,
-		Index:   r.RaftLog.LastIndex(),
+		Index:   m.Index + uint64(len(m.Entries)),
 		Reject:  false,
 	})
 }

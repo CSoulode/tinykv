@@ -75,13 +75,14 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			return
 		}
 
+		var compactToSchedule uint64 = 0
 		if adminReq := request.AdminRequest; adminReq != nil {
 			switch adminReq.CmdType {
 			case raft_cmdpb.AdminCmdType_ChangePeer:
 			case raft_cmdpb.AdminCmdType_CompactLog:
 				d.peerStorage.applyState.TruncatedState.Index = adminReq.CompactLog.CompactIndex
 				d.peerStorage.applyState.TruncatedState.Term = adminReq.CompactLog.CompactTerm
-				d.ScheduleCompactLog(adminReq.CompactLog.CompactIndex)
+				compactToSchedule = adminReq.CompactLog.CompactIndex
 			case raft_cmdpb.AdminCmdType_TransferLeader:
 			case raft_cmdpb.AdminCmdType_Split:
 			}
@@ -103,6 +104,9 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		d.peerStorage.applyState.AppliedIndex = ent.Index
 		kvWb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 		kvWb.WriteToDB(d.peerStorage.Engines.Kv)
+		if compactToSchedule != 0 {
+			d.ScheduleCompactLog(compactToSchedule)
+		}
 
 		for len(d.proposals) > 0 && d.proposals[0].index < ent.Index {
 			d.proposals[0].cb.Done(ErrResp(&util.ErrStaleCommand{}))

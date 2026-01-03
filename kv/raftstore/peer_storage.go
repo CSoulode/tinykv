@@ -312,8 +312,8 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 		return nil
 	}
 
-	for _, entry := range entries {
-		raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
+	for i := range entries {
+		raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entries[i].Index), &entries[i])
 	}
 
 	appendLastIndex := entries[len(entries)-1].Index
