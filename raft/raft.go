@@ -190,8 +190,8 @@ func newRaft(c *Config) *Raft {
 		Lead:             None,
 		heartbeatTimeout: c.HeartbeatTick,
 		electionTimeout:  c.ElectionTick,
-		heartbeatElapsed: c.HeartbeatTick,
-		electionElapsed:  c.ElectionTick,
+		heartbeatElapsed: 0,
+		electionElapsed:  0,
 		leadTransferee:   0,
 		PendingConfIndex: 0,
 	}
@@ -245,9 +245,11 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 	offset := r.RaftLog.entries[0].Index
 	entries := r.RaftLog.entries[prevLogIndex+1-offset:]
+	entriesCopy := make([]pb.Entry, len(entries))
+	copy(entriesCopy, entries)
 	entriess := make([]*pb.Entry, len(entries))
-	for i := range entries {
-		entriess[i] = &entries[i]
+	for i := range entriesCopy {
+		entriess[i] = &entriesCopy[i]
 	}
 	return r.send(pb.Message{
 		MsgType: pb.MessageType_MsgAppend,
@@ -346,6 +348,10 @@ func (r *Raft) sendTimeoutNow(to uint64) bool {
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+	if r.Prs[r.id] == nil {
+		return
+	}
+
 	if r.State != StateLeader {
 		r.electionElapsed++
 		if r.electionElapsed >= r.randomizedElectionTimeout {
@@ -378,7 +384,6 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
 	r.electionElapsed = 0
 	r.resetRandomizedElectionTimeout()
-	r.Vote = None
 	r.State = StateFollower
 	r.Lead = lead
 	if term > r.Term {
@@ -447,12 +452,21 @@ func (r *Raft) Step(m pb.Message) error {
 		}
 		r.becomeFollower(m.Term, lead)
 	case m.Term < r.Term:
-		if m.MsgType == pb.MessageType_MsgHeartbeat || m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgSnapshot {
+		switch m.MsgType {
+		case pb.MessageType_MsgHeartbeat, pb.MessageType_MsgAppend, pb.MessageType_MsgSnapshot:
 			r.send(pb.Message{
 				MsgType: pb.MessageType_MsgAppendResponse,
 				To:      m.From,
 				From:    r.id,
 				Term:    r.Term,
+			})
+		case pb.MessageType_MsgRequestVote:
+			r.send(pb.Message{
+				MsgType: pb.MessageType_MsgRequestVoteResponse,
+				To:      m.From,
+				From:    r.id,
+				Term:    r.Term,
+				Reject:  true,
 			})
 		}
 		return nil
@@ -709,16 +723,6 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 }
 
 func (r *Raft) handleRequestVote(m pb.Message) {
-	if m.Term < r.Term {
-		r.send(pb.Message{
-			MsgType: pb.MessageType_MsgRequestVoteResponse,
-			To:      m.From,
-			From:    r.id,
-			Term:    r.Term,
-			Reject:  true,
-		})
-		return
-	}
 	lastIndex := r.RaftLog.LastIndex()
 	lastTerm, _ := r.RaftLog.Term(lastIndex)
 	reject := true
@@ -768,12 +772,20 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	if m.Snapshot == nil || r.RaftLog.pendingSnapshot != nil {
 		return
 	}
+
+	if r.State == StateCandidate {
+		r.becomeFollower(m.Term, m.From)
+	}
+	r.Lead = m.From
+	r.electionElapsed = 0
+
 	snapshot := m.Snapshot
 	if r.restore(snapshot) {
 		r.send(pb.Message{
 			MsgType: pb.MessageType_MsgAppendResponse,
 			To:      m.From,
 			From:    r.id,
+			Term:    r.Term,
 			Index:   r.RaftLog.LastIndex(),
 		})
 	} else {
@@ -781,6 +793,7 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 			MsgType: pb.MessageType_MsgAppendResponse,
 			To:      m.From,
 			From:    r.id,
+			Term:    r.Term,
 			Index:   r.RaftLog.committed,
 		})
 	}
@@ -883,7 +896,7 @@ func (r *Raft) addNode(id uint64) {
 	}
 
 	r.Prs[id] = &Progress{
-		Match: r.RaftLog.entries[0].Index,
+		Match: 0,
 		Next:  r.RaftLog.LastIndex() + 1,
 	}
 }

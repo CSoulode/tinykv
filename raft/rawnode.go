@@ -116,11 +116,15 @@ func (rn *RawNode) Propose(data []byte) error {
 
 // ProposeConfChange proposes a config change.
 func (rn *RawNode) ProposeConfChange(cc pb.ConfChange) error {
+	if rn.Raft.PendingConfIndex > rn.Raft.RaftLog.applied {
+		return ErrProposalDropped
+	}
 	data, err := cc.Marshal()
 	if err != nil {
 		return err
 	}
 	ent := pb.Entry{EntryType: pb.EntryType_EntryConfChange, Data: data}
+	rn.Raft.PendingConfIndex = rn.Raft.RaftLog.LastIndex() + 1
 	return rn.Raft.Step(pb.Message{
 		MsgType: pb.MessageType_MsgPropose,
 		Entries: []*pb.Entry{&ent},
